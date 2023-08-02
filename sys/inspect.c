@@ -702,7 +702,7 @@ TLInspectTransportClassify(
 /* ++
 
    This is the classifyFn function for the Transport (v4 and v6) callout.
-   packets (inbound or outbound) are ueued to the packet queue to be processed 
+   packets (inbound or outbound) are queued to the packet queue to be processed 
    by the worker thread.
 
 -- */

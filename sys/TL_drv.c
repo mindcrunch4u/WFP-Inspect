@@ -31,6 +31,11 @@ Environment:
 
 --*/
 
+#include "extra.h"
+
+boolean gInspectAll = false;
+boolean gInspectAllByDefault = true;
+
 #define POOL_ZERO_DOWN_LEVEL_SUPPORT
 #include <ntddk.h>
 #include <wdf.h>
@@ -367,20 +372,23 @@ TLInspectRegisterALEClassifyCallouts(
       goto Exit;
    }
 
-   status = TLInspectAddFilter(
-               L"Transport Inspect ALE Classify",
-               L"Intercepts inbound or outbound connect attempts",
-               (IsEqualGUID(layerKey, &FWPM_LAYER_ALE_AUTH_CONNECT_V4) ||
-                IsEqualGUID(layerKey, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4)) ? 
-                  configInspectRemoteAddrV4 : configInspectRemoteAddrV6,
-               0,
-               layerKey,
-               calloutKey
-               );
-
-   if (!NT_SUCCESS(status))
+   if (!gInspectAll)
    {
-      goto Exit;
+      status = TLInspectAddFilter(
+         L"Transport Inspect ALE Classify",
+         L"Intercepts inbound or outbound connect attempts",
+         (IsEqualGUID(layerKey, &FWPM_LAYER_ALE_AUTH_CONNECT_V4) ||
+            IsEqualGUID(layerKey, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4)) ?
+         configInspectRemoteAddrV4 : configInspectRemoteAddrV6,
+         0,
+         layerKey,
+         calloutKey
+      );
+
+      if (!NT_SUCCESS(status))
+      {
+         goto Exit;
+      }
    }
 
 Exit:
@@ -459,20 +467,23 @@ TLInspectRegisterTransportCallouts(
       goto Exit;
    }
 
-   status = TLInspectAddFilter(
-               L"Transport Inspect Filter (Outbound)",
-               L"Inspect inbound/outbound transport traffic",
-               (IsEqualGUID(layerKey, &FWPM_LAYER_OUTBOUND_TRANSPORT_V4) ||
-                IsEqualGUID(layerKey, &FWPM_LAYER_INBOUND_TRANSPORT_V4))? 
-                  configInspectRemoteAddrV4 : configInspectRemoteAddrV6,
-               0,
-               layerKey,
-               calloutKey
-               );
-
-   if (!NT_SUCCESS(status))
+   if (!gInspectAll)
    {
-      goto Exit;
+      status = TLInspectAddFilter(
+         L"Transport Inspect Filter (Outbound)",
+         L"Inspect inbound/outbound transport traffic",
+         (IsEqualGUID(layerKey, &FWPM_LAYER_OUTBOUND_TRANSPORT_V4) ||
+            IsEqualGUID(layerKey, &FWPM_LAYER_INBOUND_TRANSPORT_V4)) ?
+         configInspectRemoteAddrV4 : configInspectRemoteAddrV6,
+         0,
+         layerKey,
+         calloutKey
+      );
+
+      if (!NT_SUCCESS(status))
+      {
+         goto Exit;
+      }
    }
 
 Exit:
@@ -843,11 +854,21 @@ DriverEntry(
       goto Exit;
    }
 
-   if ((configInspectRemoteAddrV4 == NULL) && 
-       (configInspectRemoteAddrV6 == NULL))
+   if (gInspectAllByDefault)
    {
-      status = STATUS_DEVICE_CONFIGURATION_ERROR;
-      goto Exit;
+      print("Build option gInspectAllByDefault set, inspecting all addresses.\n");
+      configInspectRemoteAddrV4 = NULL;
+      configInspectRemoteAddrV6 = NULL;
+      gInspectAll = true;
+   }
+   else
+   {
+      if ((configInspectRemoteAddrV4 == NULL) &&
+         (configInspectRemoteAddrV6 == NULL))
+      {
+         print("No remote address set, inspecting all addresses.\n");
+         gInspectAll = true;
+      }
    }
 
    status = FwpsInjectionHandleCreate(
