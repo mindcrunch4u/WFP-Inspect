@@ -797,6 +797,253 @@ Exit:
    return;
 }
 
+void
+TLInspectIpClassify(
+   _In_ const FWPS_INCOMING_VALUES* inFixedValues,
+   _In_ const FWPS_INCOMING_METADATA_VALUES* inMetaValues,
+   _Inout_opt_ void* layerData,
+   _In_opt_ const void* classifyContext,
+   _In_ const FWPS_FILTER* filter,
+   _In_ UINT64 flowContext,
+   _Inout_ FWPS_CLASSIFY_OUT* classifyOut
+)
+{
+   KLOCK_QUEUE_HANDLE connListLockHandle;
+   KLOCK_QUEUE_HANDLE packetQueueLockHandle;
+
+   TL_INSPECT_PENDED_PACKET* pendedPacket = NULL;
+   FWP_DIRECTION packetDirection;
+
+   ADDRESS_FAMILY addressFamily;
+   FWPS_PACKET_INJECTION_STATE packetState;
+   BOOLEAN signalWorkerThread;
+
+#if(NTDDI_VERSION >= NTDDI_WIN7)
+   UNREFERENCED_PARAMETER(classifyContext);
+#endif /// (NTDDI_VERSION >= NTDDI_WIN7)
+   UNREFERENCED_PARAMETER(filter);
+   UNREFERENCED_PARAMETER(flowContext);
+   UNREFERENCED_PARAMETER(classifyOut);
+   UNREFERENCED_PARAMETER(packetQueueLockHandle);
+   UNREFERENCED_PARAMETER(signalWorkerThread);
+   UNREFERENCED_PARAMETER(packetState);
+   UNREFERENCED_PARAMETER(pendedPacket);
+   UNREFERENCED_PARAMETER(connListLockHandle);
+
+
+   addressFamily = GetAddressFamilyForLayer(inFixedValues->layerId);
+
+   packetDirection =
+      GetPacketDirectionForLayer(inFixedValues->layerId);
+   char debugAddressFamily[24] = { 0 };
+   char debugPacketDirection[24] = { 0 };
+   if (addressFamily == AF_INET)
+   {
+      _snprintf(debugAddressFamily, sizeof(debugAddressFamily), "%s", "IPv4");
+   }
+   else if (addressFamily == AF_INET6)
+   {
+      _snprintf(debugAddressFamily, sizeof(debugAddressFamily), "%s", "IPv6");
+   }
+   else
+   {
+      _snprintf(debugAddressFamily, sizeof(debugAddressFamily), "Unparsed %d", addressFamily);
+   }
+   if (packetDirection == FWP_DIRECTION_OUTBOUND)
+   {
+      _snprintf(debugPacketDirection, sizeof(debugPacketDirection), "%s", "OUT");
+   }
+   else
+   {
+      _snprintf(debugPacketDirection, sizeof(debugPacketDirection), "%s", "IN");
+   }
+
+   const char* debugPacketProtocol = NULL;
+   IPV4HDR* header4 = NULL;
+   //IPV6HDR* header6 = NULL;
+   VOID* header = NULL;
+   for (NET_BUFFER_LIST* nbl = (NET_BUFFER_LIST*)layerData; nbl; nbl = nbl->Next) {
+      NET_BUFFER* nb = NET_BUFFER_LIST_FIRST_NB(nbl);
+      header = NdisGetDataBuffer(nb, inMetaValues->ipHeaderSize + inMetaValues->transportHeaderSize, NULL, 1, 0);
+
+      if (!header)
+         continue;
+      if (addressFamily != AF_INET)
+         /*TODO: support IPv6*/
+         continue;
+
+      header4 = (IPV4HDR*)header;
+      if (header4)
+      {
+         debugPacketProtocol = protocol_to_str(((UCHAR*)header)[inMetaValues->ipHeaderSize + 9]);
+
+         DbgPrint("T[%p] [%s] [%s] [%5s]\n",
+            KeGetCurrentThread(),
+            debugAddressFamily,
+            debugPacketDirection,
+            debugPacketProtocol
+         );
+      }
+
+      /*
+      DbgPrint("MAC address: %02x-%02x-%02x-%02x-%02x-%02x\n",
+         header[0], header[1], header[2],
+         header[3], header[4], header[5]);
+      */
+   }
+
+#if 0
+
+
+   //
+   // We don't have the necessary right to alter the classify, exit.
+   //
+   if ((classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) == 0)
+   {
+      goto Exit;
+   }
+
+   NT_ASSERT(layerData != NULL);
+   _Analysis_assume_(layerData != NULL);
+
+   //
+   // We don't re-inspect packets that we've inspected earlier.
+   //
+   packetState = FwpsQueryPacketInjectionState(
+      gInjectionHandle,
+      layerData,
+      NULL
+   );
+
+   if ((packetState == FWPS_PACKET_INJECTED_BY_SELF) ||
+      (packetState == FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF))
+   {
+      classifyOut->actionType = FWP_ACTION_PERMIT;
+      if (filter->flags & FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT)
+      {
+         classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+      }
+
+      goto Exit;
+   }
+
+   if (packetDirection == FWP_DIRECTION_INBOUND)
+   {
+      if (IsAleClassifyRequired(inFixedValues, inMetaValues))
+      {
+         //
+         // Inbound transport packets that are destined to ALE Recv-Accept 
+         // layers, for initial authorization or reauth, should be inspected 
+         // at the ALE layer. We permit it from Tranport here.
+         //
+         classifyOut->actionType = FWP_ACTION_PERMIT;
+         if (filter->flags & FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT)
+         {
+            classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+         }
+         goto Exit;
+      }
+      else
+      {
+         //
+         // To be compatible with Vista's IpSec implementation, we must not
+         // intercept not-yet-detunneled IpSec traffic.
+         //
+         FWPS_PACKET_LIST_INFORMATION packetInfo = { 0 };
+         FwpsGetPacketListSecurityInformation(
+            layerData,
+            FWPS_PACKET_LIST_INFORMATION_QUERY_IPSEC |
+            FWPS_PACKET_LIST_INFORMATION_QUERY_INBOUND,
+            &packetInfo
+         );
+
+         if (packetInfo.ipsecInformation.inbound.isTunnelMode &&
+            !packetInfo.ipsecInformation.inbound.isDeTunneled)
+         {
+            classifyOut->actionType = FWP_ACTION_PERMIT;
+            if (filter->flags & FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT)
+            {
+               classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+            }
+            goto Exit;
+         }
+      }
+   }
+
+   pendedPacket = AllocateAndInitializePendedPacket(
+      inFixedValues,
+      inMetaValues,
+      addressFamily,
+      layerData,
+      TL_INSPECT_DATA_PACKET,
+      packetDirection
+   );
+
+   if (pendedPacket == NULL)
+   {
+      classifyOut->actionType = FWP_ACTION_BLOCK;
+      classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+      goto Exit;
+   }
+
+   KeAcquireInStackQueuedSpinLock(
+      &gConnListLock,
+      &connListLockHandle
+   );
+   KeAcquireInStackQueuedSpinLock(
+      &gPacketQueueLock,
+      &packetQueueLockHandle
+   );
+
+   if (!gDriverUnloading)
+   {
+      signalWorkerThread = IsListEmpty(&gPacketQueue) &&
+         IsListEmpty(&gConnList);
+
+      InsertTailList(&gPacketQueue, &pendedPacket->listEntry);
+      pendedPacket = NULL; // ownership transferred
+
+      classifyOut->actionType = FWP_ACTION_BLOCK;
+      classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+      classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
+   }
+   else
+   {
+      //
+      // Driver is being unloaded, permit any connect classify.
+      //
+      signalWorkerThread = FALSE;
+
+      classifyOut->actionType = FWP_ACTION_PERMIT;
+      if (filter->flags & FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT)
+      {
+         classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+      }
+   }
+
+   KeReleaseInStackQueuedSpinLock(&packetQueueLockHandle);
+   KeReleaseInStackQueuedSpinLock(&connListLockHandle);
+
+   if (signalWorkerThread)
+   {
+      KeSetEvent(
+         &gWorkerEvent,
+         0,
+         FALSE
+      );
+   }
+
+Exit:
+
+   if (pendedPacket != NULL)
+   {
+      FreePendedPacket(pendedPacket);
+   }
+
+   return;
+#endif
+}
+
 #if(NTDDI_VERSION >= NTDDI_WIN7)
 
 void
@@ -829,7 +1076,7 @@ TLInspectTransportClassify(
    packets (inbound or outbound) are queued to the packet queue to be processed
    by the worker thread.
 
--- */
+-- */ 
 {
    KLOCK_QUEUE_HANDLE connListLockHandle;
    KLOCK_QUEUE_HANDLE packetQueueLockHandle;
@@ -881,7 +1128,7 @@ TLInspectTransportClassify(
    VOID* header = NULL;
    for (NET_BUFFER_LIST* nbl = (NET_BUFFER_LIST*)layerData; nbl; nbl = nbl->Next) {
       NET_BUFFER* nb = NET_BUFFER_LIST_FIRST_NB(nbl);
-      header = NdisGetDataBuffer(nb, inMetaValues->ipHeaderSize + inMetaValues->transportHeaderSize, NULL, 1, 0);
+      header = NdisGetDataBuffer(nb, inMetaValues->transportHeaderSize, NULL, 1, 0);
       
       if (!header)
          continue;
@@ -891,17 +1138,7 @@ TLInspectTransportClassify(
       header4 = (IPV4HDR*)header;
       if (header4)
       {
-         debugPacketProtocol = protocol_to_str(((UCHAR*)header)[0]);
-         DbgPrint("ipHeaderSize %d, transportHeaderSize %d, frameLength %d --- %d, %d, %d, %d, %d\n",
-            inMetaValues->ipHeaderSize,
-            inMetaValues->transportHeaderSize,
-            inMetaValues->frameLength,
-            ((UCHAR*)header)[inMetaValues->ipHeaderSize],
-            (UCHAR)RtlUshortByteSwap(((UCHAR*)header)[0]),
-            ((UCHAR*)header)[inMetaValues->ipHeaderSize + 9],
-            ((UCHAR*)header)[inMetaValues->ipHeaderSize + 20],
-            header4->Protocol
-         );
+         debugPacketProtocol = protocol_to_str(((UCHAR*)header)[9]);
          
          DbgPrint("T[%p] [%s] [%s] [%5s]\n",
             KeGetCurrentThread(),
@@ -1099,6 +1336,20 @@ TLInspectALERecvAcceptNotify(
 
 NTSTATUS
 TLInspectTransportNotify(
+   _In_ FWPS_CALLOUT_NOTIFY_TYPE notifyType,
+   _In_ const GUID* filterKey,
+   _Inout_ const FWPS_FILTER* filter
+)
+{
+   UNREFERENCED_PARAMETER(notifyType);
+   UNREFERENCED_PARAMETER(filterKey);
+   UNREFERENCED_PARAMETER(filter);
+
+   return STATUS_SUCCESS;
+}
+
+NTSTATUS
+TLInspectIpNotify(
    _In_ FWPS_CALLOUT_NOTIFY_TYPE notifyType,
    _In_ const GUID* filterKey,
    _Inout_ const FWPS_FILTER* filter

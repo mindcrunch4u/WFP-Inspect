@@ -74,6 +74,22 @@ IN6_ADDR remoteAddrStorageV6;
 // Callout and sublayer GUIDs
 //
 
+// 236c1c75-a658-41e3-ba5e-f6ce79d9dac3
+DEFINE_GUID(
+   TL_INSPECT_OUTBOUND_IP_CALLOUT_V4,
+   0x236c1c75,
+   0xa658,
+   0x41e3,
+   0xba, 0x5e, 0xf6, 0xce, 0x79, 0xd9, 0xda, 0xc3
+);
+DEFINE_GUID(
+   TL_INSPECT_INBOUND_IP_CALLOUT_V4,
+   0xa9124e3e,
+   0xdb8d,
+   0x4a49,
+   0x97, 0x92, 0x6f, 0xaf, 0x9e, 0x2a, 0xf8, 0xd0
+);
+
 // bb6e405b-19f4-4ff3-b501-1a3dc01aae01
 DEFINE_GUID(
     TL_INSPECT_OUTBOUND_TRANSPORT_CALLOUT_V4,
@@ -159,6 +175,7 @@ DEVICE_OBJECT* gWdmDevice;
 WDFKEY gParametersKey;
 
 HANDLE gEngineHandle;
+UINT32 gIpOutboundTlCalloutIdV4, gIpInboundTlCalloutIdV4;
 UINT32 gAleConnectCalloutIdV4, gOutboundTlCalloutIdV4;
 UINT32 gAleRecvAcceptCalloutIdV4, gInboundTlCalloutIdV4;
 UINT32 gAleConnectCalloutIdV6, gOutboundTlCalloutIdV6;
@@ -427,6 +444,94 @@ Exit:
    return status;
 }
 
+NTSTATUS TLInspectRegisterIpCallouts(
+         _In_ const GUID* layerKey,
+         _In_ const GUID* calloutKey,
+         _Inout_ void* deviceObject,
+         _Out_ UINT32* calloutId
+      )
+{
+      NTSTATUS status = STATUS_SUCCESS;
+
+      FWPS_CALLOUT sCallout = { 0 };
+      FWPM_CALLOUT mCallout = { 0 };
+
+      FWPM_DISPLAY_DATA displayData = { 0 };
+
+      BOOLEAN calloutRegistered = FALSE;
+
+      sCallout.calloutKey = *calloutKey;
+      sCallout.classifyFn = TLInspectIpClassify;
+      sCallout.notifyFn = TLInspectIpNotify;
+
+      status = FwpsCalloutRegister(
+         deviceObject,
+         &sCallout,
+         calloutId
+      );
+      if (!NT_SUCCESS(status))
+      {
+         DbgPrint("Cannot register transport layer callout.\n");
+         goto Exit;
+      }
+      calloutRegistered = TRUE;
+
+      displayData.name = L"Transport Inspect Callout";
+      displayData.description = L"Inspect inbound/outbound transport traffic";
+
+      mCallout.calloutKey = *calloutKey;
+      mCallout.displayData = displayData;
+      mCallout.applicableLayer = *layerKey;
+
+      status = FwpmCalloutAdd(
+         gEngineHandle,
+         &mCallout,
+         NULL,
+         NULL
+      );
+
+      if (!NT_SUCCESS(status))
+      {
+         goto Exit;
+      }
+
+
+      status = TLInspectAddFilter(
+         L"Transport Inspect Filter (Outbound)",
+         L"Inspect inbound/outbound transport traffic",
+         (IsEqualGUID(layerKey, &FWPM_LAYER_OUTBOUND_TRANSPORT_V4) ||
+            IsEqualGUID(layerKey, &FWPM_LAYER_INBOUND_TRANSPORT_V4)) ?
+         configInspectRemoteAddrV4 : configInspectRemoteAddrV6,
+         0,
+         layerKey,
+         calloutKey,
+         gInspectAll
+      );
+
+      if (!NT_SUCCESS(status))
+      {
+         goto Exit;
+      }
+
+   Exit:
+
+      if (!NT_SUCCESS(status))
+      {
+         if (calloutRegistered)
+         {
+            FwpsCalloutUnregisterById(*calloutId);
+            *calloutId = 0;
+         }
+         DbgPrint("Failed to register IP layer callout.\n");
+      }
+      else
+      {
+         DbgPrint("IP layer callout registered.\n");
+      }
+
+      return status;
+   }
+
 NTSTATUS
 TLInspectRegisterTransportCallouts(
    _In_ const GUID* layerKey,
@@ -590,6 +695,30 @@ TLInspectRegisterCallouts(
    }
    if (gInspectAll)
    {
+      DbgPrint("Ip outbound layer registration.\n");
+      status = TLInspectRegisterIpCallouts(
+         &FWPM_LAYER_OUTBOUND_IPPACKET_V4,
+         &TL_INSPECT_OUTBOUND_IP_CALLOUT_V4,
+         deviceObject,
+         &gIpOutboundTlCalloutIdV4
+      );
+      if (!NT_SUCCESS(status))
+      {
+         goto Exit;
+      }
+
+      DbgPrint("Ip inbound layer registration.\n");
+      status = TLInspectRegisterIpCallouts(
+         &FWPM_LAYER_INBOUND_IPPACKET_V4,
+         &TL_INSPECT_INBOUND_IP_CALLOUT_V4,
+         deviceObject,
+         &gIpInboundTlCalloutIdV4
+      );
+      if (!NT_SUCCESS(status))
+      {
+         goto Exit;
+      }
+#if 0
       DbgPrint("Transport outbound layer registration.\n");
       status = TLInspectRegisterTransportCallouts(
          &FWPM_LAYER_OUTBOUND_TRANSPORT_V4,
@@ -613,6 +742,7 @@ TLInspectRegisterCallouts(
       {
          goto Exit;
       }
+#endif
    }
    else /* if an IP address was given, and "gInspectAll" is off, then inspect the given address. */
    {
@@ -741,6 +871,9 @@ TLInspectUnregisterCallouts(void)
 {
    FwpmEngineClose(gEngineHandle);
    gEngineHandle = NULL;
+
+   FwpsCalloutUnregisterById(gIpOutboundTlCalloutIdV4);
+   FwpsCalloutUnregisterById(gIpInboundTlCalloutIdV4);
 
    FwpsCalloutUnregisterById(gOutboundTlCalloutIdV6);
    FwpsCalloutUnregisterById(gOutboundTlCalloutIdV4);
