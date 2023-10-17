@@ -707,7 +707,7 @@ TLInspectTransportClassify(
 
 -- */
 {
-
+   DbgPrint("Packet seen.\n");
    KLOCK_QUEUE_HANDLE connListLockHandle;
    KLOCK_QUEUE_HANDLE packetQueueLockHandle;
 
@@ -717,7 +717,7 @@ TLInspectTransportClassify(
    ADDRESS_FAMILY addressFamily;
    FWPS_PACKET_INJECTION_STATE packetState;
    BOOLEAN signalWorkerThread;
-
+   
 #if(NTDDI_VERSION >= NTDDI_WIN7)
    UNREFERENCED_PARAMETER(classifyContext);
 #endif /// (NTDDI_VERSION >= NTDDI_WIN7)

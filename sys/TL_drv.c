@@ -33,9 +33,6 @@ Environment:
 
 #include "extra.h"
 
-boolean gInspectAll = false;
-boolean gInspectAllByDefault = true;
-
 #define POOL_ZERO_DOWN_LEVEL_SUPPORT
 #include <ntddk.h>
 #include <wdf.h>
@@ -58,6 +55,8 @@ boolean gInspectAllByDefault = true;
 #define INITGUID
 #include <guiddef.h>
 
+BOOLEAN gInspectAll = FALSE;
+BOOLEAN gInspectAllByDefault = TRUE;
 
 // 
 // Configurable parameters (addresses and ports are in host order)
@@ -240,62 +239,85 @@ TLInspectAddFilter(
    _In_reads_opt_(16) const UINT8* remoteAddr,
    _In_ UINT64 context,
    _In_ const GUID* layerKey,
-   _In_ const GUID* calloutKey
+   _In_ const GUID* calloutKey,
+   BOOL isInspectAll
    )
 {
    NTSTATUS status = STATUS_SUCCESS;
-
-   FWPM_FILTER filter = {0};
-   FWPM_FILTER_CONDITION filterConditions[3] = {0}; 
-   UINT conditionIndex;
-
-   filter.layerKey = *layerKey;
-   filter.displayData.name = (wchar_t*)filterName;
-   filter.displayData.description = (wchar_t*)filterDesc;
-
-   filter.action.type = FWP_ACTION_CALLOUT_TERMINATING;
-   filter.action.calloutKey = *calloutKey;
-   filter.filterCondition = filterConditions;
-   filter.subLayerKey = TL_INSPECT_SUBLAYER;
-   filter.weight.type = FWP_EMPTY; // auto-weight.
-   filter.rawContext = context;
-
-   conditionIndex = 0;
-
-   if (remoteAddr != NULL)
+   if (isInspectAll)
    {
-      filterConditions[conditionIndex].fieldKey = 
-         FWPM_CONDITION_IP_REMOTE_ADDRESS;
-      filterConditions[conditionIndex].matchType = FWP_MATCH_EQUAL;
+      UNREFERENCED_PARAMETER(remoteAddr);
+      FWPM_FILTER0 filter = { 0 };
+      filter.displayData.name = (wchar_t*)filterName;
+      filter.displayData.description = (wchar_t*)filterDesc;
 
-      if (IsEqualGUID(layerKey, &FWPM_LAYER_ALE_AUTH_CONNECT_V4) ||
-          IsEqualGUID(layerKey, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4) ||
-          IsEqualGUID(layerKey, &FWPM_LAYER_INBOUND_TRANSPORT_V4) ||
-          IsEqualGUID(layerKey, &FWPM_LAYER_OUTBOUND_TRANSPORT_V4))
-      {
-         filterConditions[conditionIndex].conditionValue.type = FWP_UINT32;
-         filterConditions[conditionIndex].conditionValue.uint32 = 
-            *(UINT32*)remoteAddr;
-      }
-      else
-      {
-         filterConditions[conditionIndex].conditionValue.type = 
-            FWP_BYTE_ARRAY16_TYPE;
-         filterConditions[conditionIndex].conditionValue.byteArray16 = 
-            (FWP_BYTE_ARRAY16*)remoteAddr;
-      }
-
-      conditionIndex++;
+      filter.flags = FWPM_FILTER_FLAG_NONE;
+      filter.layerKey = *layerKey;
+      filter.weight.type = FWP_EMPTY; // auto-weight.
+      filter.numFilterConditions = 0;
+      filter.action.type = FWP_ACTION_CALLOUT_TERMINATING;
+      filter.action.calloutKey = *calloutKey;
+      filter.rawContext = context;
+      status = FwpmFilterAdd(
+         gEngineHandle,
+         &filter,
+         NULL,
+         NULL);
+      DbgPrint("Registered unconditional filter, driver will inspect every packet.\n");
    }
+   else
+   {
+      FWPM_FILTER filter = { 0 };
+      FWPM_FILTER_CONDITION filterConditions[3] = { 0 };
+      UINT conditionIndex;
 
-   filter.numFilterConditions = conditionIndex;
+      filter.layerKey = *layerKey;
+      filter.displayData.name = (wchar_t*)filterName;
+      filter.displayData.description = (wchar_t*)filterDesc;
 
-   status = FwpmFilterAdd(
-               gEngineHandle,
-               &filter,
-               NULL,
-               NULL);
+      filter.action.type = FWP_ACTION_CALLOUT_TERMINATING;
+      filter.action.calloutKey = *calloutKey;
+      filter.filterCondition = filterConditions;
+      filter.subLayerKey = TL_INSPECT_SUBLAYER;
+      filter.weight.type = FWP_EMPTY; // auto-weight.
+      filter.rawContext = context;
 
+      conditionIndex = 0;
+
+      if (remoteAddr != NULL)
+      {
+         filterConditions[conditionIndex].fieldKey =
+            FWPM_CONDITION_IP_REMOTE_ADDRESS;
+         filterConditions[conditionIndex].matchType = FWP_MATCH_EQUAL;
+
+         if (IsEqualGUID(layerKey, &FWPM_LAYER_ALE_AUTH_CONNECT_V4) ||
+            IsEqualGUID(layerKey, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4) ||
+            IsEqualGUID(layerKey, &FWPM_LAYER_INBOUND_TRANSPORT_V4) ||
+            IsEqualGUID(layerKey, &FWPM_LAYER_OUTBOUND_TRANSPORT_V4))
+         {
+            filterConditions[conditionIndex].conditionValue.type = FWP_UINT32;
+            filterConditions[conditionIndex].conditionValue.uint32 =
+               *(UINT32*)remoteAddr;
+         }
+         else
+         {
+            filterConditions[conditionIndex].conditionValue.type =
+               FWP_BYTE_ARRAY16_TYPE;
+            filterConditions[conditionIndex].conditionValue.byteArray16 =
+               (FWP_BYTE_ARRAY16*)remoteAddr;
+         }
+
+         conditionIndex++;
+      }
+
+      filter.numFilterConditions = conditionIndex;
+
+      status = FwpmFilterAdd(
+         gEngineHandle,
+         &filter,
+         NULL,
+         NULL);
+   }
    return status;
 }
 
@@ -372,24 +394,24 @@ TLInspectRegisterALEClassifyCallouts(
       goto Exit;
    }
 
-   if (!gInspectAll)
-   {
-      status = TLInspectAddFilter(
-         L"Transport Inspect ALE Classify",
-         L"Intercepts inbound or outbound connect attempts",
-         (IsEqualGUID(layerKey, &FWPM_LAYER_ALE_AUTH_CONNECT_V4) ||
-            IsEqualGUID(layerKey, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4)) ?
-         configInspectRemoteAddrV4 : configInspectRemoteAddrV6,
-         0,
-         layerKey,
-         calloutKey
-      );
 
-      if (!NT_SUCCESS(status))
-      {
-         goto Exit;
-      }
+   status = TLInspectAddFilter(
+      L"Transport Inspect ALE Classify",
+      L"Intercepts inbound or outbound connect attempts",
+      (IsEqualGUID(layerKey, &FWPM_LAYER_ALE_AUTH_CONNECT_V4) ||
+         IsEqualGUID(layerKey, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4)) ?
+      configInspectRemoteAddrV4 : configInspectRemoteAddrV6,
+      0,
+      layerKey,
+      calloutKey,
+      gInspectAll
+   );
+
+   if (!NT_SUCCESS(status))
+   {
+      goto Exit;
    }
+
 
 Exit:
 
@@ -444,6 +466,7 @@ TLInspectRegisterTransportCallouts(
                );
    if (!NT_SUCCESS(status))
    {
+      DbgPrint("Cannot register transport layer callout.\n");
       goto Exit;
    }
    calloutRegistered = TRUE;
@@ -467,23 +490,22 @@ TLInspectRegisterTransportCallouts(
       goto Exit;
    }
 
-   if (!gInspectAll)
-   {
-      status = TLInspectAddFilter(
-         L"Transport Inspect Filter (Outbound)",
-         L"Inspect inbound/outbound transport traffic",
-         (IsEqualGUID(layerKey, &FWPM_LAYER_OUTBOUND_TRANSPORT_V4) ||
-            IsEqualGUID(layerKey, &FWPM_LAYER_INBOUND_TRANSPORT_V4)) ?
-         configInspectRemoteAddrV4 : configInspectRemoteAddrV6,
-         0,
-         layerKey,
-         calloutKey
-      );
 
-      if (!NT_SUCCESS(status))
-      {
-         goto Exit;
-      }
+   status = TLInspectAddFilter(
+      L"Transport Inspect Filter (Outbound)",
+      L"Inspect inbound/outbound transport traffic",
+      (IsEqualGUID(layerKey, &FWPM_LAYER_OUTBOUND_TRANSPORT_V4) ||
+         IsEqualGUID(layerKey, &FWPM_LAYER_INBOUND_TRANSPORT_V4)) ?
+      configInspectRemoteAddrV4 : configInspectRemoteAddrV6,
+      0,
+      layerKey,
+      calloutKey,
+      gInspectAll
+   );
+
+   if (!NT_SUCCESS(status))
+   {
+      goto Exit;
    }
 
 Exit:
@@ -495,6 +517,11 @@ Exit:
          FwpsCalloutUnregisterById(*calloutId);
          *calloutId = 0;
       }
+      DbgPrint("Failed to register transport layer callout.\n");
+   }
+   else
+   {
+      DbgPrint("Transport layer callout registered.\n");
    }
 
    return status;
@@ -561,98 +588,125 @@ TLInspectRegisterCallouts(
    {
       goto Exit;
    }
-
-   if (configInspectRemoteAddrV4 != NULL)
+   if (gInspectAll)
    {
-      status = TLInspectRegisterALEClassifyCallouts(
-                  &FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-                  &TL_INSPECT_ALE_CONNECT_CALLOUT_V4,
-                  deviceObject,
-                  &gAleConnectCalloutIdV4
-                  );
-      if (!NT_SUCCESS(status))
-      {
-         goto Exit;
-      }
-
-      status = TLInspectRegisterALEClassifyCallouts(
-                  &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
-                  &TL_INSPECT_ALE_RECV_ACCEPT_CALLOUT_V4,
-                  deviceObject,
-                  &gAleRecvAcceptCalloutIdV4
-                  );
-      if (!NT_SUCCESS(status))
-      {
-         goto Exit;
-      }
-
+      DbgPrint("Transport outbound layer registration.\n");
       status = TLInspectRegisterTransportCallouts(
-                  &FWPM_LAYER_OUTBOUND_TRANSPORT_V4,
-                  &TL_INSPECT_OUTBOUND_TRANSPORT_CALLOUT_V4,
-                  deviceObject,
-                  &gOutboundTlCalloutIdV4
-                  );
+         &FWPM_LAYER_OUTBOUND_TRANSPORT_V4,
+         &TL_INSPECT_OUTBOUND_TRANSPORT_CALLOUT_V4,
+         deviceObject,
+         &gOutboundTlCalloutIdV4
+      );
       if (!NT_SUCCESS(status))
       {
          goto Exit;
       }
 
+      DbgPrint("Transport inbound layer registration.\n");
       status = TLInspectRegisterTransportCallouts(
-                  &FWPM_LAYER_INBOUND_TRANSPORT_V4,
-                  &TL_INSPECT_INBOUND_TRANSPORT_CALLOUT_V4,
-                  deviceObject,
-                  &gInboundTlCalloutIdV4
-                  );
+         &FWPM_LAYER_INBOUND_TRANSPORT_V4,
+         &TL_INSPECT_INBOUND_TRANSPORT_CALLOUT_V4,
+         deviceObject,
+         &gInboundTlCalloutIdV4
+      );
       if (!NT_SUCCESS(status))
       {
          goto Exit;
       }
    }
-
-   if (configInspectRemoteAddrV6 != NULL)
+   else /* if an IP address was given, and "gInspectAll" isn't turned on, then inspect the given address. */
    {
-      status = TLInspectRegisterALEClassifyCallouts(
-                  &FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-                  &TL_INSPECT_ALE_CONNECT_CALLOUT_V6,
-                  deviceObject,
-                  &gAleConnectCalloutIdV6
-                  );
-      if (!NT_SUCCESS(status))
+      if (configInspectRemoteAddrV4 != NULL)
       {
-         goto Exit;
-      }
+         status = TLInspectRegisterALEClassifyCallouts(
+            &FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+            &TL_INSPECT_ALE_CONNECT_CALLOUT_V4,
+            deviceObject,
+            &gAleConnectCalloutIdV4
+         );
+         if (!NT_SUCCESS(status))
+         {
+            goto Exit;
+         }
 
-      status = TLInspectRegisterALEClassifyCallouts(
-                  &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
-                  &TL_INSPECT_ALE_RECV_ACCEPT_CALLOUT_V6,
-                  deviceObject,
-                  &gAleRecvAcceptCalloutIdV6
-                  );
-      if (!NT_SUCCESS(status))
-      {
-         goto Exit;
-      }
+         status = TLInspectRegisterALEClassifyCallouts(
+            &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
+            &TL_INSPECT_ALE_RECV_ACCEPT_CALLOUT_V4,
+            deviceObject,
+            &gAleRecvAcceptCalloutIdV4
+         );
+         if (!NT_SUCCESS(status))
+         {
+            goto Exit;
+         }
 
-      status = TLInspectRegisterTransportCallouts(
-                  &FWPM_LAYER_OUTBOUND_TRANSPORT_V6,
-                  &TL_INSPECT_OUTBOUND_TRANSPORT_CALLOUT_V6,
-                  deviceObject,
-                  &gOutboundTlCalloutIdV6
-                  );
-      if (!NT_SUCCESS(status))
-      {
-         goto Exit;
-      }
+         status = TLInspectRegisterTransportCallouts(
+            &FWPM_LAYER_OUTBOUND_TRANSPORT_V4,
+            &TL_INSPECT_OUTBOUND_TRANSPORT_CALLOUT_V4,
+            deviceObject,
+            &gOutboundTlCalloutIdV4
+         );
+         if (!NT_SUCCESS(status))
+         {
+            goto Exit;
+         }
 
-      status = TLInspectRegisterTransportCallouts(
-                  &FWPM_LAYER_INBOUND_TRANSPORT_V6,
-                  &TL_INSPECT_INBOUND_TRANSPORT_CALLOUT_V6,
-                  deviceObject,
-                  &gInboundTlCalloutIdV6
-                  );
-      if (!NT_SUCCESS(status))
+         status = TLInspectRegisterTransportCallouts(
+            &FWPM_LAYER_INBOUND_TRANSPORT_V4,
+            &TL_INSPECT_INBOUND_TRANSPORT_CALLOUT_V4,
+            deviceObject,
+            &gInboundTlCalloutIdV4
+         );
+         if (!NT_SUCCESS(status))
+         {
+            goto Exit;
+         }
+      }
+      if (configInspectRemoteAddrV6 != NULL)
       {
-         goto Exit;
+         status = TLInspectRegisterALEClassifyCallouts(
+            &FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+            &TL_INSPECT_ALE_CONNECT_CALLOUT_V6,
+            deviceObject,
+            &gAleConnectCalloutIdV6
+         );
+         if (!NT_SUCCESS(status))
+         {
+            goto Exit;
+         }
+
+         status = TLInspectRegisterALEClassifyCallouts(
+            &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
+            &TL_INSPECT_ALE_RECV_ACCEPT_CALLOUT_V6,
+            deviceObject,
+            &gAleRecvAcceptCalloutIdV6
+         );
+         if (!NT_SUCCESS(status))
+         {
+            goto Exit;
+         }
+
+         status = TLInspectRegisterTransportCallouts(
+            &FWPM_LAYER_OUTBOUND_TRANSPORT_V6,
+            &TL_INSPECT_OUTBOUND_TRANSPORT_CALLOUT_V6,
+            deviceObject,
+            &gOutboundTlCalloutIdV6
+         );
+         if (!NT_SUCCESS(status))
+         {
+            goto Exit;
+         }
+
+         status = TLInspectRegisterTransportCallouts(
+            &FWPM_LAYER_INBOUND_TRANSPORT_V6,
+            &TL_INSPECT_INBOUND_TRANSPORT_CALLOUT_V6,
+            deviceObject,
+            &gInboundTlCalloutIdV6
+         );
+         if (!NT_SUCCESS(status))
+         {
+            goto Exit;
+         }
       }
    }
 
@@ -856,18 +910,18 @@ DriverEntry(
 
    if (gInspectAllByDefault)
    {
-      print("Build option gInspectAllByDefault set, inspecting all addresses.\n");
+      DbgPrint("Build option gInspectAllByDefault set, inspecting all addresses.\n");
       configInspectRemoteAddrV4 = NULL;
       configInspectRemoteAddrV6 = NULL;
-      gInspectAll = true;
+      gInspectAll = TRUE;
    }
    else
    {
       if ((configInspectRemoteAddrV4 == NULL) &&
          (configInspectRemoteAddrV6 == NULL))
       {
-         print("No remote address set, inspecting all addresses.\n");
-         gInspectAll = true;
+         DbgPrint("No remote address set, inspecting all addresses.\n");
+         gInspectAll = TRUE;
       }
    }
 
