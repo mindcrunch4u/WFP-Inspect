@@ -614,7 +614,7 @@ TLInspectRegisterCallouts(
          goto Exit;
       }
    }
-   else /* if an IP address was given, and "gInspectAll" isn't turned on, then inspect the given address. */
+   else /* if an IP address was given, and "gInspectAll" is off, then inspect the given address. */
    {
       if (configInspectRemoteAddrV4 != NULL)
       {

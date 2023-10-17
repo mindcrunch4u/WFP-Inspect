@@ -5,15 +5,15 @@ Copyright (c) Microsoft Corporation. All rights reserved
 Abstract:
 
    This file implements the classifyFn callout functions for the ALE connect,
-   recv-accept, and transport callouts. In addition the system worker thread 
-   that performs the actual packet inspection is also implemented here along 
+   recv-accept, and transport callouts. In addition the system worker thread
+   that performs the actual packet inspection is also implemented here along
    with the eventing mechanisms shared between the classify function and the
    worker thread.
 
-   connect/Packet inspection is done out-of-band by a system worker thread 
-   using the reference-drop-clone-reinject as well as ALE pend/complete 
-   mechanism. Therefore the sample can serve as a base in scenarios where 
-   filtering decision cannot be made within the classifyFn() callout and 
+   connect/Packet inspection is done out-of-band by a system worker thread
+   using the reference-drop-clone-reinject as well as ALE pend/complete
+   mechanism. Therefore the sample can serve as a base in scenarios where
+   filtering decision cannot be made within the classifyFn() callout and
    instead must be made, for example, by an user-mode application.
 
 Environment:
@@ -36,6 +36,130 @@ Environment:
 
 #include "inspect.h"
 #include "utils.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include "extra.h"
+
+/*from: wireguard-nt\driver\arithmetic.h */
+typedef  UINT16 UINT16_BE;
+typedef  UINT16 UINT16_LE;
+typedef  UINT32 UINT32_BE;
+typedef  UINT32 UINT32_LE;
+typedef  UINT64 UINT64_BE;
+typedef  UINT64 UINT64_LE;
+
+/*from: wireguard-nt\driver\messages.h */
+typedef struct _IPV4HDR
+{
+#if REG_DWORD == REG_DWORD_LITTLE_ENDIAN
+   UINT8 Ihl : 4, Version : 4;
+#elif REG_DWORD == REG_DWORD_BIG_ENDIAN
+   UINT8 Version : 4, Ihl : 4;
+#endif
+   UINT8 Tos;
+   UINT16_BE TotLen;
+   UINT16_BE Id;
+   UINT16_BE FragOff;
+   UINT8 Ttl;
+   UINT8 Protocol;
+   UINT16_BE Check;
+   UINT32_BE Saddr;
+   UINT32_BE Daddr;
+} IPV4HDR;
+
+typedef struct _IPV6HDR
+{
+#if REG_DWORD == REG_DWORD_LITTLE_ENDIAN
+   UINT8 Priority : 4, Version : 4;
+#elif REG_DWORD == REG_DWORD_BIG_ENDIAN
+   UINT8 Version : 4, Priority : 4;
+#endif
+   UINT8 FlowLbl[3];
+   UINT16_BE PayloadLen;
+   UINT8 Nexthdr;
+   UINT8 HopLimit;
+   IN6_ADDR Saddr;
+   IN6_ADDR Daddr;
+} IPV6HDR;
+
+const char* protocol_to_str(UCHAR protocol)
+{
+   // source: https://learn.microsoft.com/en-us/graph/api/resources/securitynetworkprotocol?view=graph-rest-1.0
+   const char* protocol_str = "Error";
+   switch (protocol)
+   {
+   case 3:
+      protocol_str = "Ggp";
+      break;
+   case 1:
+      protocol_str = "Icmp";
+      break;
+   case 58:
+      protocol_str = "IcmpV6";
+      break;
+   case 22:
+      protocol_str = "Idp";
+      break;
+   case 2:
+      protocol_str = "Igmp";
+      break;
+   case 0:
+      protocol_str = "IP/IPv6HopByHopOptions/Unspecified";
+      break;
+   case 51:
+      protocol_str = "IPSecAuthenticationHeader";
+      break;
+   case 50:
+      protocol_str = "IPSecEncapsulatingSecurityPayload";
+      break;
+   case 4:
+      protocol_str = "IPv4";
+      break;
+   case 41:
+      protocol_str = "IPv6";
+      break;
+   case 60:
+      protocol_str = "IPv6DestinationOptions";
+      break;
+   case 44:
+      protocol_str = "IPv6FragmentHeader";
+      break;
+   case 59:
+      protocol_str = "IPv6NoNextHeader";
+      break;
+   case 43:
+      protocol_str = "IPv6RoutingHeader";
+      break;
+   case 1000:
+      protocol_str = "Ipx";
+      break;
+   case 77:
+      protocol_str = "ND";
+      break;
+   case 12:
+      protocol_str = "Pup";
+      break;
+   case 255:
+      protocol_str = "Raw";
+      break;
+   case 1256:
+      protocol_str = "Spx";
+      break;
+   case 1257:
+      protocol_str = "SpxII";
+      break;
+   case 6:
+      protocol_str = "Tcp";
+      break;
+   case 17:
+      protocol_str = "Udp";
+      break;
+   case -1:
+      protocol_str = "Unknown";
+      break;
+   }
+   return protocol_str;
+}
 
 #if(NTDDI_VERSION >= NTDDI_WIN7)
 
@@ -48,7 +172,7 @@ TLInspectALEConnectClassify(
    _In_ const FWPS_FILTER* filter,
    _In_ UINT64 flowContext,
    _Inout_ FWPS_CLASSIFY_OUT* classifyOut
-   )
+)
 
 #else
 
@@ -60,7 +184,7 @@ TLInspectALEConnectClassify(
    _In_ const FWPS_FILTER* filter,
    _In_ UINT64 flowContext,
    _Inout_ FWPS_CLASSIFY_OUT* classifyOut
-   )
+)
 
 #endif /// (NTDDI_VERSION >= NTDDI_WIN7)
 
@@ -71,9 +195,9 @@ TLInspectALEConnectClassify(
    is not set), it is queued to the connection list for inspection by the
    worker thread. For re-auth, we first check if it is triggered by an ealier
    FwpsCompleteOperation call by looking for an pended connect that has been
-   inspected. If found, we remove it from the connect list and return the 
-   inspection result; otherwise we can conclude that the re-auth is triggered 
-   by policy change so we queue it to the packet queue to be process by the 
+   inspected. If found, we remove it from the connect list and return the
+   inspection result; otherwise we can conclude that the re-auth is triggered
+   by policy change so we queue it to the packet queue to be process by the
    worker thread like any other regular packets.
 
 -- */
@@ -111,13 +235,13 @@ TLInspectALEConnectClassify(
       // We don't re-inspect packets that we've inspected earlier.
       //
       packetState = FwpsQueryPacketInjectionState(
-                     gInjectionHandle,
-                     layerData,
-                     NULL
-                     );
+         gInjectionHandle,
+         layerData,
+         NULL
+      );
 
       if ((packetState == FWPS_PACKET_INJECTED_BY_SELF) ||
-          (packetState == FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF))
+         (packetState == FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF))
       {
          classifyOut->actionType = FWP_ACTION_PERMIT;
          if (filter->flags & FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT)
@@ -139,13 +263,13 @@ TLInspectALEConnectClassify(
       // for out-of-band processing.
       //
       pendedConnect = AllocateAndInitializePendedPacket(
-                           inFixedValues,
-                           inMetaValues,
-                           addressFamily,
-                           layerData,
-                           TL_INSPECT_CONNECT_PACKET,
-                           FWP_DIRECTION_OUTBOUND
-                           );
+         inFixedValues,
+         inMetaValues,
+         addressFamily,
+         layerData,
+         TL_INSPECT_CONNECT_PACKET,
+         FWP_DIRECTION_OUTBOUND
+      );
 
       if (pendedConnect == NULL)
       {
@@ -154,16 +278,16 @@ TLInspectALEConnectClassify(
          goto Exit;
       }
 
-      NT_ASSERT(FWPS_IS_METADATA_FIELD_PRESENT(inMetaValues, 
-                                            FWPS_METADATA_FIELD_COMPLETION_HANDLE));
+      NT_ASSERT(FWPS_IS_METADATA_FIELD_PRESENT(inMetaValues,
+         FWPS_METADATA_FIELD_COMPLETION_HANDLE));
 
       //
       // Pend the ALE_AUTH_CONNECT classify.
       //
       status = FwpsPendOperation(
-                  inMetaValues->completionHandle,
-                  &pendedConnect->completionContext
-                  );
+         inMetaValues->completionHandle,
+         &pendedConnect->completionContext
+      );
 
       if (!NT_SUCCESS(status))
       {
@@ -175,14 +299,14 @@ TLInspectALEConnectClassify(
       KeAcquireInStackQueuedSpinLock(
          &gConnListLock,
          &connListLockHandle
-         );
+      );
       KeAcquireInStackQueuedSpinLock(
          &gPacketQueueLock,
          &packetQueueLockHandle
-         );
+      );
 
-      signalWorkerThread = IsListEmpty(&gConnList) && 
-                           IsListEmpty(&gPacketQueue);
+      signalWorkerThread = IsListEmpty(&gConnList) &&
+         IsListEmpty(&gPacketQueue);
 
       InsertTailList(&gConnList, &pendedConnect->listEntry);
       pendedConnect = NULL; // ownership transferred
@@ -197,10 +321,10 @@ TLInspectALEConnectClassify(
       if (signalWorkerThread)
       {
          KeSetEvent(
-            &gWorkerEvent, 
-            0, 
+            &gWorkerEvent,
+            0,
             FALSE
-            );
+         );
       }
    }
    else // re-auth @ ALE_AUTH_CONNECT
@@ -218,8 +342,8 @@ TLInspectALEConnectClassify(
       //       immediately after a policy change at ALE_AUTH_CONNECT layer.
       //
 
-      NT_ASSERT(FWPS_IS_METADATA_FIELD_PRESENT(inMetaValues, 
-                                            FWPS_METADATA_FIELD_PACKET_DIRECTION));
+      NT_ASSERT(FWPS_IS_METADATA_FIELD_PRESENT(inMetaValues,
+         FWPS_METADATA_FIELD_PACKET_DIRECTION));
       packetDirection = inMetaValues->packetDirection;
 
       if (packetDirection == FWP_DIRECTION_OUTBOUND)
@@ -237,43 +361,43 @@ TLInspectALEConnectClassify(
          KeAcquireInStackQueuedSpinLock(
             &gConnListLock,
             &connListLockHandle
-            );
+         );
 
          for (listEntry = gConnList.Flink;
-              listEntry != &gConnList;
-              listEntry = listEntry->Flink)
+            listEntry != &gConnList;
+            listEntry = listEntry->Flink)
          {
             connEntry = CONTAINING_RECORD(
-                            listEntry,
-                            TL_INSPECT_PENDED_PACKET,
-                            listEntry
-                            );
+               listEntry,
+               TL_INSPECT_PENDED_PACKET,
+               listEntry
+            );
 
             if (IsMatchingConnectPacket(
-                     inFixedValues,
-                     addressFamily,
-                     packetDirection,
-                     connEntry
-                  ) && (connEntry->authConnectDecision != 0))
+               inFixedValues,
+               addressFamily,
+               packetDirection,
+               connEntry
+            ) && (connEntry->authConnectDecision != 0))
             {
                // We found a match.
                pendedConnect = connEntry;
 
                NT_ASSERT((pendedConnect->authConnectDecision == FWP_ACTION_PERMIT) ||
-                      (pendedConnect->authConnectDecision == FWP_ACTION_BLOCK));
-               
+                  (pendedConnect->authConnectDecision == FWP_ACTION_BLOCK));
+
                classifyOut->actionType = pendedConnect->authConnectDecision;
-               if (classifyOut->actionType == FWP_ACTION_BLOCK || 
-                     filter->flags & FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT)
+               if (classifyOut->actionType == FWP_ACTION_BLOCK ||
+                  filter->flags & FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT)
                {
                   classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
                }
 
                RemoveEntryList(&pendedConnect->listEntry);
-               
+
                if (!gDriverUnloading &&
-                   (pendedConnect->netBufferList != NULL) &&
-                   (pendedConnect->authConnectDecision == FWP_ACTION_PERMIT))
+                  (pendedConnect->netBufferList != NULL) &&
+                  (pendedConnect->authConnectDecision == FWP_ACTION_PERMIT))
                {
                   //
                   // Now the outbound connection has been authorized. If the
@@ -286,23 +410,23 @@ TLInspectALEConnectClassify(
                   KeAcquireInStackQueuedSpinLock(
                      &gPacketQueueLock,
                      &packetQueueLockHandle
-                     );
+                  );
 
                   signalWorkerThread = IsListEmpty(&gPacketQueue) &&
-                                       IsListEmpty(&gConnList);
+                     IsListEmpty(&gConnList);
 
                   InsertTailList(&gPacketQueue, &pendedConnect->listEntry);
                   pendedConnect = NULL; // ownership transferred
 
                   KeReleaseInStackQueuedSpinLock(&packetQueueLockHandle);
-                  
+
                   if (signalWorkerThread)
                   {
                      KeSetEvent(
-                        &gWorkerEvent, 
-                        0, 
+                        &gWorkerEvent,
+                        0,
                         FALSE
-                        );
+                     );
                   }
                }
 
@@ -329,13 +453,13 @@ TLInspectALEConnectClassify(
       NT_ASSERT(layerData != NULL);
 
       pendedPacket = AllocateAndInitializePendedPacket(
-                        inFixedValues,
-                        inMetaValues,
-                        addressFamily,
-                        layerData,
-                        TL_INSPECT_REAUTH_PACKET,
-                        packetDirection
-                        );
+         inFixedValues,
+         inMetaValues,
+         addressFamily,
+         layerData,
+         TL_INSPECT_REAUTH_PACKET,
+         packetDirection
+      );
 
       if (pendedPacket == NULL)
       {
@@ -352,16 +476,16 @@ TLInspectALEConnectClassify(
       KeAcquireInStackQueuedSpinLock(
          &gConnListLock,
          &connListLockHandle
-         );
+      );
       KeAcquireInStackQueuedSpinLock(
          &gPacketQueueLock,
          &packetQueueLockHandle
-         );
+      );
 
       if (!gDriverUnloading)
       {
          signalWorkerThread = IsListEmpty(&gPacketQueue) &&
-                              IsListEmpty(&gConnList);
+            IsListEmpty(&gConnList);
 
          InsertTailList(&gPacketQueue, &pendedPacket->listEntry);
          pendedPacket = NULL; // ownership transferred
@@ -390,10 +514,10 @@ TLInspectALEConnectClassify(
       if (signalWorkerThread)
       {
          KeSetEvent(
-            &gWorkerEvent, 
-            0, 
+            &gWorkerEvent,
+            0,
             FALSE
-            );
+         );
       }
 
    }
@@ -423,7 +547,7 @@ TLInspectALERecvAcceptClassify(
    _In_ const FWPS_FILTER* filter,
    _In_ UINT64 flowContext,
    _Inout_ FWPS_CLASSIFY_OUT* classifyOut
-   )
+)
 
 #else
 
@@ -435,7 +559,7 @@ TLInspectALERecvAcceptClassify(
    _In_ const FWPS_FILTER* filter,
    _In_ UINT64 flowContext,
    _Inout_ FWPS_CLASSIFY_OUT* classifyOut
-   )
+)
 
 #endif /// (NTDDI_VERSION >= NTDDI_WIN7)
 /* ++
@@ -443,7 +567,7 @@ TLInspectALERecvAcceptClassify(
    This is the classifyFn function for the ALE Recv-Accept (v4 and v6) callout.
    For an initial classify (where the FWP_CONDITION_FLAG_IS_REAUTHORIZE flag
    is not set), it is queued to the connection list for inspection by the
-   worker thread. For re-auth, it is queued to the packet queue to be process 
+   worker thread. For re-auth, it is queued to the packet queue to be process
    by the worker thread like any other regular packets.
 
 -- */
@@ -474,20 +598,20 @@ TLInspectALERecvAcceptClassify(
       goto Exit;
    }
 
-  NT_ASSERT(layerData != NULL);
-  _Analysis_assume_(layerData != NULL);
+   NT_ASSERT(layerData != NULL);
+   _Analysis_assume_(layerData != NULL);
 
    //
    // We don't re-inspect packets that we've inspected earlier.
    //
    packetState = FwpsQueryPacketInjectionState(
-                     gInjectionHandle,
-                     layerData,
-                     NULL
-                     );
+      gInjectionHandle,
+      layerData,
+      NULL
+   );
 
    if ((packetState == FWPS_PACKET_INJECTED_BY_SELF) ||
-       (packetState == FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF))
+      (packetState == FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF))
    {
       classifyOut->actionType = FWP_ACTION_PERMIT;
       if (filter->flags & FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT)
@@ -508,13 +632,13 @@ TLInspectALERecvAcceptClassify(
       // for out-of-band processing.
       //
       pendedRecvAccept = AllocateAndInitializePendedPacket(
-                              inFixedValues,
-                              inMetaValues,
-                              addressFamily,
-                              layerData,
-                              TL_INSPECT_CONNECT_PACKET,
-                              FWP_DIRECTION_INBOUND
-                              );
+         inFixedValues,
+         inMetaValues,
+         addressFamily,
+         layerData,
+         TL_INSPECT_CONNECT_PACKET,
+         FWP_DIRECTION_INBOUND
+      );
 
       if (pendedRecvAccept == NULL)
       {
@@ -523,16 +647,16 @@ TLInspectALERecvAcceptClassify(
          goto Exit;
       }
 
-      NT_ASSERT(FWPS_IS_METADATA_FIELD_PRESENT(inMetaValues, 
-                                            FWPS_METADATA_FIELD_COMPLETION_HANDLE));
+      NT_ASSERT(FWPS_IS_METADATA_FIELD_PRESENT(inMetaValues,
+         FWPS_METADATA_FIELD_COMPLETION_HANDLE));
 
       //
       // Pend the ALE_AUTH_RECV_ACCEPT classify.
       //
       status = FwpsPendOperation(
-                  inMetaValues->completionHandle,
-                  &pendedRecvAccept->completionContext
-                  );
+         inMetaValues->completionHandle,
+         &pendedRecvAccept->completionContext
+      );
 
       if (!NT_SUCCESS(status))
       {
@@ -544,14 +668,14 @@ TLInspectALERecvAcceptClassify(
       KeAcquireInStackQueuedSpinLock(
          &gConnListLock,
          &connListLockHandle
-         );
+      );
       KeAcquireInStackQueuedSpinLock(
          &gPacketQueueLock,
          &packetQueueLockHandle
-         );
+      );
 
-      signalWorkerThread = IsListEmpty(&gConnList) && 
-                           IsListEmpty(&gPacketQueue);
+      signalWorkerThread = IsListEmpty(&gConnList) &&
+         IsListEmpty(&gPacketQueue);
 
       InsertTailList(&gConnList, &pendedRecvAccept->listEntry);
       pendedRecvAccept = NULL; // ownership transferred
@@ -566,10 +690,10 @@ TLInspectALERecvAcceptClassify(
       if (signalWorkerThread)
       {
          KeSetEvent(
-            &gWorkerEvent, 
-            0, 
+            &gWorkerEvent,
+            0,
             FALSE
-            );
+         );
       }
 
    }
@@ -586,18 +710,18 @@ TLInspectALERecvAcceptClassify(
       //       immediately after a policy change at ALE_AUTH_RECV_ACCEPT layer.
       //
 
-      NT_ASSERT(FWPS_IS_METADATA_FIELD_PRESENT(inMetaValues, 
-                                            FWPS_METADATA_FIELD_PACKET_DIRECTION));
+      NT_ASSERT(FWPS_IS_METADATA_FIELD_PRESENT(inMetaValues,
+         FWPS_METADATA_FIELD_PACKET_DIRECTION));
       packetDirection = inMetaValues->packetDirection;
 
       pendedPacket = AllocateAndInitializePendedPacket(
-                        inFixedValues,
-                        inMetaValues,
-                        addressFamily,
-                        layerData,
-                        TL_INSPECT_REAUTH_PACKET,
-                        packetDirection
-                        );
+         inFixedValues,
+         inMetaValues,
+         addressFamily,
+         layerData,
+         TL_INSPECT_REAUTH_PACKET,
+         packetDirection
+      );
 
       if (pendedPacket == NULL)
       {
@@ -614,16 +738,16 @@ TLInspectALERecvAcceptClassify(
       KeAcquireInStackQueuedSpinLock(
          &gConnListLock,
          &connListLockHandle
-         );
+      );
       KeAcquireInStackQueuedSpinLock(
          &gPacketQueueLock,
          &packetQueueLockHandle
-         );
+      );
 
       if (!gDriverUnloading)
       {
          signalWorkerThread = IsListEmpty(&gPacketQueue) &&
-                              IsListEmpty(&gConnList);
+            IsListEmpty(&gConnList);
 
          InsertTailList(&gPacketQueue, &pendedPacket->listEntry);
          pendedPacket = NULL; // ownership transferred
@@ -652,10 +776,10 @@ TLInspectALERecvAcceptClassify(
       if (signalWorkerThread)
       {
          KeSetEvent(
-            &gWorkerEvent, 
-            0, 
+            &gWorkerEvent,
+            0,
             FALSE
-            );
+         );
       }
    }
 
@@ -684,7 +808,7 @@ TLInspectTransportClassify(
    _In_ const FWPS_FILTER* filter,
    _In_ UINT64 flowContext,
    _Inout_ FWPS_CLASSIFY_OUT* classifyOut
-   )
+)
 
 #else
 
@@ -696,18 +820,17 @@ TLInspectTransportClassify(
    _In_ const FWPS_FILTER* filter,
    _In_ UINT64 flowContext,
    _Inout_ FWPS_CLASSIFY_OUT* classifyOut
-   )
+)
 
 #endif
 /* ++
 
    This is the classifyFn function for the Transport (v4 and v6) callout.
-   packets (inbound or outbound) are queued to the packet queue to be processed 
+   packets (inbound or outbound) are queued to the packet queue to be processed
    by the worker thread.
 
 -- */
 {
-   DbgPrint("Packet seen.\n");
    KLOCK_QUEUE_HANDLE connListLockHandle;
    KLOCK_QUEUE_HANDLE packetQueueLockHandle;
 
@@ -717,12 +840,86 @@ TLInspectTransportClassify(
    ADDRESS_FAMILY addressFamily;
    FWPS_PACKET_INJECTION_STATE packetState;
    BOOLEAN signalWorkerThread;
-   
+
 #if(NTDDI_VERSION >= NTDDI_WIN7)
    UNREFERENCED_PARAMETER(classifyContext);
 #endif /// (NTDDI_VERSION >= NTDDI_WIN7)
    UNREFERENCED_PARAMETER(filter);
    UNREFERENCED_PARAMETER(flowContext);
+
+
+   addressFamily = GetAddressFamilyForLayer(inFixedValues->layerId);
+
+   packetDirection =
+      GetPacketDirectionForLayer(inFixedValues->layerId);
+   char debugAddressFamily[24] = { 0 };
+   char debugPacketDirection[24] = { 0 };
+   if (addressFamily == AF_INET)
+   {
+      _snprintf(debugAddressFamily, sizeof(debugAddressFamily), "%s", "IPv4");
+   }
+   else if (addressFamily == AF_INET6)
+   {
+      _snprintf(debugAddressFamily, sizeof(debugAddressFamily), "%s", "IPv6");
+   }
+   else
+   {
+      _snprintf(debugAddressFamily, sizeof(debugAddressFamily), "Unparsed %d", addressFamily);
+   }
+   if (packetDirection == FWP_DIRECTION_OUTBOUND)
+   {
+      _snprintf(debugPacketDirection, sizeof(debugPacketDirection), "%s", "OUT");
+   }
+   else
+   {
+      _snprintf(debugPacketDirection, sizeof(debugPacketDirection), "%s", "IN");
+   }
+
+   const char* debugPacketProtocol = NULL;
+   IPV4HDR* header4 = NULL;
+   //IPV6HDR* header6 = NULL;
+   VOID* header = NULL;
+   for (NET_BUFFER_LIST* nbl = (NET_BUFFER_LIST*)layerData; nbl; nbl = nbl->Next) {
+      NET_BUFFER* nb = NET_BUFFER_LIST_FIRST_NB(nbl);
+      header = NdisGetDataBuffer(nb, inMetaValues->ipHeaderSize + inMetaValues->transportHeaderSize, NULL, 1, 0);
+      
+      if (!header)
+         continue;
+      if (addressFamily != AF_INET)
+         continue;
+
+      header4 = (IPV4HDR*)header;
+      if (header4)
+      {
+         debugPacketProtocol = protocol_to_str(((UCHAR*)header)[0]);
+         DbgPrint("ipHeaderSize %d, transportHeaderSize %d, frameLength %d --- %d, %d, %d, %d, %d\n",
+            inMetaValues->ipHeaderSize,
+            inMetaValues->transportHeaderSize,
+            inMetaValues->frameLength,
+            ((UCHAR*)header)[inMetaValues->ipHeaderSize],
+            (UCHAR)RtlUshortByteSwap(((UCHAR*)header)[0]),
+            ((UCHAR*)header)[inMetaValues->ipHeaderSize + 9],
+            ((UCHAR*)header)[inMetaValues->ipHeaderSize + 20],
+            header4->Protocol
+         );
+         
+         DbgPrint("T[%p] [%s] [%s] [%5s]\n",
+            KeGetCurrentThread(),
+            debugAddressFamily,
+            debugPacketDirection,
+            debugPacketProtocol
+         );
+      }
+      
+      /*
+      DbgPrint("MAC address: %02x-%02x-%02x-%02x-%02x-%02x\n",
+         header[0], header[1], header[2],
+         header[3], header[4], header[5]);
+      */
+   }
+
+
+
 
    //
    // We don't have the necessary right to alter the classify, exit.
@@ -732,20 +929,20 @@ TLInspectTransportClassify(
       goto Exit;
    }
 
-  NT_ASSERT(layerData != NULL);
-  _Analysis_assume_(layerData != NULL);
+   NT_ASSERT(layerData != NULL);
+   _Analysis_assume_(layerData != NULL);
 
    //
    // We don't re-inspect packets that we've inspected earlier.
    //
    packetState = FwpsQueryPacketInjectionState(
-                     gInjectionHandle,
-                     layerData,
-                     NULL
-                     );
+      gInjectionHandle,
+      layerData,
+      NULL
+   );
 
    if ((packetState == FWPS_PACKET_INJECTED_BY_SELF) ||
-       (packetState == FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF))
+      (packetState == FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF))
    {
       classifyOut->actionType = FWP_ACTION_PERMIT;
       if (filter->flags & FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT)
@@ -755,11 +952,6 @@ TLInspectTransportClassify(
 
       goto Exit;
    }
-
-   addressFamily = GetAddressFamilyForLayer(inFixedValues->layerId);
-
-   packetDirection = 
-      GetPacketDirectionForLayer(inFixedValues->layerId);
 
    if (packetDirection == FWP_DIRECTION_INBOUND)
    {
@@ -783,16 +975,16 @@ TLInspectTransportClassify(
          // To be compatible with Vista's IpSec implementation, we must not
          // intercept not-yet-detunneled IpSec traffic.
          //
-         FWPS_PACKET_LIST_INFORMATION packetInfo = {0};
+         FWPS_PACKET_LIST_INFORMATION packetInfo = { 0 };
          FwpsGetPacketListSecurityInformation(
             layerData,
             FWPS_PACKET_LIST_INFORMATION_QUERY_IPSEC |
             FWPS_PACKET_LIST_INFORMATION_QUERY_INBOUND,
             &packetInfo
-            );
+         );
 
          if (packetInfo.ipsecInformation.inbound.isTunnelMode &&
-             !packetInfo.ipsecInformation.inbound.isDeTunneled)
+            !packetInfo.ipsecInformation.inbound.isDeTunneled)
          {
             classifyOut->actionType = FWP_ACTION_PERMIT;
             if (filter->flags & FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT)
@@ -805,13 +997,13 @@ TLInspectTransportClassify(
    }
 
    pendedPacket = AllocateAndInitializePendedPacket(
-                     inFixedValues,
-                     inMetaValues,
-                     addressFamily,
-                     layerData,
-                     TL_INSPECT_DATA_PACKET,
-                     packetDirection
-                     );
+      inFixedValues,
+      inMetaValues,
+      addressFamily,
+      layerData,
+      TL_INSPECT_DATA_PACKET,
+      packetDirection
+   );
 
    if (pendedPacket == NULL)
    {
@@ -823,16 +1015,16 @@ TLInspectTransportClassify(
    KeAcquireInStackQueuedSpinLock(
       &gConnListLock,
       &connListLockHandle
-      );
+   );
    KeAcquireInStackQueuedSpinLock(
       &gPacketQueueLock,
       &packetQueueLockHandle
-      );
+   );
 
    if (!gDriverUnloading)
    {
       signalWorkerThread = IsListEmpty(&gPacketQueue) &&
-                           IsListEmpty(&gConnList);
+         IsListEmpty(&gConnList);
 
       InsertTailList(&gPacketQueue, &pendedPacket->listEntry);
       pendedPacket = NULL; // ownership transferred
@@ -861,10 +1053,10 @@ TLInspectTransportClassify(
    if (signalWorkerThread)
    {
       KeSetEvent(
-         &gWorkerEvent, 
-         0, 
+         &gWorkerEvent,
+         0,
          FALSE
-         );
+      );
    }
 
 Exit:
@@ -882,7 +1074,7 @@ TLInspectALEConnectNotify(
    _In_  FWPS_CALLOUT_NOTIFY_TYPE notifyType,
    _In_ const GUID* filterKey,
    _Inout_ const FWPS_FILTER* filter
-   )
+)
 {
    UNREFERENCED_PARAMETER(notifyType);
    UNREFERENCED_PARAMETER(filterKey);
@@ -896,7 +1088,7 @@ TLInspectALERecvAcceptNotify(
    _In_ FWPS_CALLOUT_NOTIFY_TYPE notifyType,
    _In_ const GUID* filterKey,
    _Inout_ const FWPS_FILTER* filter
-   )
+)
 {
    UNREFERENCED_PARAMETER(notifyType);
    UNREFERENCED_PARAMETER(filterKey);
@@ -910,7 +1102,7 @@ TLInspectTransportNotify(
    _In_ FWPS_CALLOUT_NOTIFY_TYPE notifyType,
    _In_ const GUID* filterKey,
    _Inout_ const FWPS_FILTER* filter
-   )
+)
 {
    UNREFERENCED_PARAMETER(notifyType);
    UNREFERENCED_PARAMETER(filterKey);
@@ -923,11 +1115,11 @@ void TLInspectInjectComplete(
    _Inout_ void* context,
    _Inout_ NET_BUFFER_LIST* netBufferList,
    _In_ BOOLEAN dispatchLevel
-   )
+)
 {
    TL_INSPECT_PENDED_PACKET* packet = context;
 
-   UNREFERENCED_PARAMETER(dispatchLevel);   
+   UNREFERENCED_PARAMETER(dispatchLevel);
 
    FwpsFreeCloneNetBufferList(netBufferList, 0);
 
@@ -937,7 +1129,7 @@ void TLInspectInjectComplete(
 NTSTATUS
 TLInspectCloneReinjectOutbound(
    _Inout_ TL_INSPECT_PENDED_PACKET* packet
-   )
+)
 /* ++
 
    This function clones the outbound net buffer list and reinject it back.
@@ -947,15 +1139,15 @@ TLInspectCloneReinjectOutbound(
    NTSTATUS status = STATUS_SUCCESS;
 
    NET_BUFFER_LIST* clonedNetBufferList = NULL;
-   FWPS_TRANSPORT_SEND_PARAMS sendArgs = {0};
+   FWPS_TRANSPORT_SEND_PARAMS sendArgs = { 0 };
 
    status = FwpsAllocateCloneNetBufferList(
-               packet->netBufferList,
-               NULL,
-               NULL,
-               0,
-               &clonedNetBufferList
-               );
+      packet->netBufferList,
+      NULL,
+      NULL,
+      0,
+      &clonedNetBufferList
+   );
    if (!NT_SUCCESS(status))
    {
       goto Exit;
@@ -971,17 +1163,17 @@ TLInspectCloneReinjectOutbound(
    //
 
    status = FwpsInjectTransportSendAsync(
-               gInjectionHandle,
-               NULL,
-               packet->endpointHandle,
-               0,
-               &sendArgs,
-               packet->addressFamily,
-               packet->compartmentId,
-               clonedNetBufferList,
-               TLInspectInjectComplete,
-               packet
-               );
+      gInjectionHandle,
+      NULL,
+      packet->endpointHandle,
+      0,
+      &sendArgs,
+      packet->addressFamily,
+      packet->compartmentId,
+      clonedNetBufferList,
+      TLInspectInjectComplete,
+      packet
+   );
 
    if (!NT_SUCCESS(status))
    {
@@ -1004,11 +1196,11 @@ Exit:
 NTSTATUS
 TLInspectCloneReinjectInbound(
    _Inout_ TL_INSPECT_PENDED_PACKET* packet
-   )
+)
 /* ++
 
-   This function clones the inbound net buffer list and, if needed, 
-   rebuild the IP header to remove the IpSec headers and receive-injects 
+   This function clones the inbound net buffer list and, if needed,
+   rebuild the IP header to remove the IpSec headers and receive-injects
    the clone back to the tcpip stack.
 
 -- */
@@ -1025,7 +1217,7 @@ TLInspectCloneReinjectInbound(
    // net buffer.
    //
    netBuffer = NET_BUFFER_LIST_FIRST_NB(packet->netBufferList);
-   
+
    nblOffset = NET_BUFFER_DATA_OFFSET(netBuffer);
 
    //
@@ -1047,7 +1239,7 @@ TLInspectCloneReinjectInbound(
       packet->ipHeaderSize + packet->transportHeaderSize,
       0,
       NULL
-      );
+   );
    _Analysis_assume_(ndisStatus == NDIS_STATUS_SUCCESS);
 
    //
@@ -1055,12 +1247,12 @@ TLInspectCloneReinjectInbound(
    //
 
    status = FwpsAllocateCloneNetBufferList(
-               packet->netBufferList,
-               NULL,
-               NULL,
-               0,
-               &clonedNetBufferList
-               );
+      packet->netBufferList,
+      NULL,
+      NULL,
+      0,
+      &clonedNetBufferList
+   );
 
    //
    // Undo the adjustment on the original net buffer list.
@@ -1071,7 +1263,7 @@ TLInspectCloneReinjectInbound(
       packet->ipHeaderSize + packet->transportHeaderSize,
       FALSE,
       NULL
-      );
+   );
 
    if (!NT_SUCCESS(status))
    {
@@ -1089,20 +1281,20 @@ TLInspectCloneReinjectInbound(
       // the cloned packet.
       // 
       status = FwpsConstructIpHeaderForTransportPacket(
-                  clonedNetBufferList,
-                  packet->ipHeaderSize,
-                  packet->addressFamily,
-                  (UINT8*)&packet->remoteAddr, 
-                  (UINT8*)&packet->localAddr,  
-                  packet->protocol,
-                  0,
-                  NULL,
-                  0,
-                  0,
-                  NULL,
-                  0,
-                  0
-                  );
+         clonedNetBufferList,
+         packet->ipHeaderSize,
+         packet->addressFamily,
+         (UINT8*)&packet->remoteAddr,
+         (UINT8*)&packet->localAddr,
+         packet->protocol,
+         0,
+         NULL,
+         0,
+         0,
+         NULL,
+         0,
+         0
+      );
 
       if (!NT_SUCCESS(status))
       {
@@ -1117,24 +1309,24 @@ TLInspectCloneReinjectInbound(
       FwpsCompleteOperation(
          packet->completionContext,
          clonedNetBufferList
-         );
+      );
 
       packet->completionContext = NULL;
    }
 
    status = FwpsInjectTransportReceiveAsync(
-               gInjectionHandle,
-               NULL,
-               NULL,
-               0,
-               packet->addressFamily,
-               packet->compartmentId,
-               packet->interfaceIndex,
-               packet->subInterfaceIndex,
-               clonedNetBufferList,
-               TLInspectInjectComplete,
-               packet
-               );
+      gInjectionHandle,
+      NULL,
+      NULL,
+      0,
+      packet->addressFamily,
+      packet->compartmentId,
+      packet->interfaceIndex,
+      packet->subInterfaceIndex,
+      clonedNetBufferList,
+      TLInspectInjectComplete,
+      packet
+   );
 
    if (!NT_SUCCESS(status))
    {
@@ -1158,7 +1350,7 @@ void
 TlInspectCompletePendedConnection(
    _Inout_ TL_INSPECT_PENDED_PACKET** pendedConnect,
    _In_ BOOLEAN permitTraffic
-   )
+)
 /* ++
 
    This function completes the pended connection (inbound or outbound)
@@ -1173,7 +1365,7 @@ TlInspectCompletePendedConnection(
    {
       HANDLE completionContext = pendedConnectLocal->completionContext;
 
-      pendedConnectLocal->authConnectDecision = 
+      pendedConnectLocal->authConnectDecision =
          permitTraffic ? FWP_ACTION_PERMIT : FWP_ACTION_BLOCK;
 
       //
@@ -1187,7 +1379,7 @@ TlInspectCompletePendedConnection(
       FwpsCompleteOperation(
          completionContext,
          NULL
-         );
+      );
 
       *pendedConnect = NULL; // ownership transferred to the re-auth path.
    }
@@ -1211,14 +1403,14 @@ TlInspectCompletePendedConnection(
 void
 TLInspectWorker(
    _In_ void* StartContext
-   )
+)
 /* ++
 
-   This worker thread waits for the connect and packet queue event when the 
-   queues are empty; and it will be woken up when there are connects/packets 
-   queued needing to be inspected. Once awaking, It will run in a loop to 
-   complete the pended ALE classifies and/or clone-reinject packets back 
-   until both queues are exhausted (and it will go to sleep waiting for more 
+   This worker thread waits for the connect and packet queue event when the
+   queues are empty; and it will be woken up when there are connects/packets
+   queued needing to be inspected. Once awaking, It will run in a loop to
+   complete the pended ALE classifies and/or clone-reinject packets back
+   until both queues are exhausted (and it will go to sleep waiting for more
    work).
 
    The worker thread will end once it detected the driver is unloading.
@@ -1237,15 +1429,15 @@ TLInspectWorker(
 
    UNREFERENCED_PARAMETER(StartContext);
 
-   for(;;)
+   for (;;)
    {
       KeWaitForSingleObject(
          &gWorkerEvent,
-         Executive, 
-         KernelMode, 
-         FALSE, 
+         Executive,
+         KernelMode,
+         FALSE,
          NULL
-         );
+      );
 
       if (gDriverUnloading)
       {
@@ -1259,7 +1451,7 @@ TLInspectWorker(
       KeAcquireInStackQueuedSpinLock(
          &gConnListLock,
          &connListLockHandle
-         );
+      );
 
       if (!IsListEmpty(&gConnList))
       {
@@ -1267,20 +1459,20 @@ TLInspectWorker(
          // Skip pended connections in the list, for which the auth decision is already taken.
          // They should not be for inbound connections.
          //
-         _Analysis_assume_(gConnList.Flink != NULL);         
+         _Analysis_assume_(gConnList.Flink != NULL);
          for (listEntry = gConnList.Flink;
-              listEntry != &gConnList;
-              listEntry = listEntry->Flink)
+            listEntry != &gConnList;
+            listEntry = listEntry->Flink)
          {
             packet = CONTAINING_RECORD(
-                                listEntry,
-                                TL_INSPECT_PENDED_PACKET,
-                                listEntry
-                                );
+               listEntry,
+               TL_INSPECT_PENDED_PACKET,
+               listEntry
+            );
 
             NT_ASSERT((packet->direction != FWP_DIRECTION_INBOUND) ||
-                      (packet->authConnectDecision == 0));
-        
+               (packet->authConnectDecision == 0));
+
             if (packet->authConnectDecision == 0)
             {
                found = TRUE;
@@ -1321,15 +1513,15 @@ TLInspectWorker(
          KeAcquireInStackQueuedSpinLock(
             &gPacketQueueLock,
             &packetQueueLockHandle
-            );
+         );
 
          listEntry = RemoveHeadList(&gPacketQueue);
 
          packet = CONTAINING_RECORD(
-                           listEntry,
-                           TL_INSPECT_PENDED_PACKET,
-                           listEntry
-                           );
+            listEntry,
+            TL_INSPECT_PENDED_PACKET,
+            listEntry
+         );
 
          KeReleaseInStackQueuedSpinLock(&packetQueueLockHandle);
       }
@@ -1367,14 +1559,14 @@ TLInspectWorker(
       KeAcquireInStackQueuedSpinLock(
          &gConnListLock,
          &connListLockHandle
-         );
+      );
       KeAcquireInStackQueuedSpinLock(
          &gPacketQueueLock,
          &packetQueueLockHandle
-         );
+      );
 
       if (IsListEmpty(&gConnList) && IsListEmpty(&gPacketQueue) &&
-          !gDriverUnloading)
+         !gDriverUnloading)
       {
          KeClearEvent(&gWorkerEvent);
       }
@@ -1392,16 +1584,16 @@ TLInspectWorker(
       KeAcquireInStackQueuedSpinLock(
          &gConnListLock,
          &connListLockHandle
-         );
+      );
 
       if (!IsListEmpty(&gConnList))
       {
          listEntry = gConnList.Flink;
          packet = CONTAINING_RECORD(
-                           listEntry,
-                           TL_INSPECT_PENDED_PACKET,
-                           listEntry
-                           );
+            listEntry,
+            TL_INSPECT_PENDED_PACKET,
+            listEntry
+         );
       }
 
       KeReleaseInStackQueuedSpinLock(&connListLockHandle);
@@ -1424,21 +1616,21 @@ TLInspectWorker(
       KeAcquireInStackQueuedSpinLock(
          &gPacketQueueLock,
          &packetQueueLockHandle
-         );
+      );
 
       if (!IsListEmpty(&gPacketQueue))
       {
          listEntry = RemoveHeadList(&gPacketQueue);
 
          packet = CONTAINING_RECORD(
-                           listEntry,
-                           TL_INSPECT_PENDED_PACKET,
-                           listEntry
-                           );
+            listEntry,
+            TL_INSPECT_PENDED_PACKET,
+            listEntry
+         );
       }
 
       KeReleaseInStackQueuedSpinLock(&packetQueueLockHandle);
-      
+
       if (packet != NULL)
       {
          FreePendedPacket(packet);
